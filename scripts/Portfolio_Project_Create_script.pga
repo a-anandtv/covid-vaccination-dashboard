@@ -1,0 +1,279 @@
+SELECT *
+FROM stg."CovidVaccinations"
+WHERE new_tests IS NOT NULL
+	AND people_vaccinated IS NOT NULL
+ORDER BY iso_code, date
+LIMIT 10;
+
+SELECT *
+FROM stg."CovidDeaths"
+LIMIT 10;
+
+-- Creating a time dimension table from stg
+
+CREATE TABLE dw."time_dim" AS
+SELECT
+	TO_CHAR(date, 'YYYYMMDD') AS time_id,
+	date,
+	SUBSTRING(CAST(date AS varchar), 1, 4) AS year,
+	EXTRACT(MONTH FROM date) AS month,
+	EXTRACT(DAY FROM date) AS day
+FROM (
+	SELECT DISTINCT date
+	FROM stg."CovidVaccinations"
+	UNION
+	SELECT DISTINCT date
+	FROM stg."CovidDeaths"
+	) AS dates;
+
+ALTER TABLE dw.time_dim
+ADD CONSTRAINT time_dim_pk PRIMARY KEY(time_id);
+
+-- Creating a geography dimension table from stg
+
+CREATE TABLE dw."geography_dim" AS
+SELECT
+	iso_code, continent, location
+FROM (
+	SELECT DISTINCT iso_code, continent, location
+	FROM stg."CovidVaccinations"
+	UNION
+	SELECT DISTINCT iso_code, continent, location
+	FROM stg."CovidDeaths"
+	) AS geo
+ORDER BY continent, location;
+
+ALTER TABLE dw.geography_dim
+ADD CONSTRAINT geography_dim_pk PRIMARY KEY (iso_code);
+
+-- Creating a vaccination fact table from stg
+
+DROP TABLE IF EXISTS dw."vaccination_fact";
+
+CREATE TABLE dw."vaccination_fact" AS
+SELECT
+	iso_code,
+	time_id,
+	people_vaccinated,
+	people_fully_vaccinated,
+	new_vaccinations
+FROM (
+	SELECT
+		vacc.iso_code,
+		tdim.time_id,
+		vacc.people_vaccinated,
+		vacc.people_fully_vaccinated,
+		vacc.new_vaccinations
+	FROM stg."CovidVaccinations" vacc
+	INNER JOIN dw.time_dim tdim
+		ON vacc.date = tdim.date
+	) AS vacc_agg;
+
+ALTER TABLE dw.vaccination_fact
+ADD CONSTRAINT vaccination_fact_pk PRIMARY KEY (iso_code, time_id);
+
+ALTER TABLE dw.vaccination_fact
+ADD CONSTRAINT vaccination_fact_time_fk FOREIGN KEY (time_id)
+	REFERENCES dw.time_dim (time_id);
+	
+ALTER TABLE dw.vaccination_fact
+ADD CONSTRAINT vaccination_fact_geo_fk FOREIGN KEY (iso_code)
+	REFERENCES dw.geography_dim (iso_code);
+
+-- Creating a cases fact table from stg
+
+DROP TABLE IF EXISTS dw."cases_fact";
+
+CREATE TABLE dw."cases_fact" AS
+SELECT
+	iso_code,
+	time_id,
+	population,
+	total_cases,
+	new_cases
+FROM (
+	SELECT
+		vacc.iso_code,
+		tdim.time_id,
+		deaths.population,
+		deaths.total_cases,
+		deaths.new_cases
+	FROM stg."CovidDeaths" deaths
+	INNER JOIN dw.time_dim tdim
+		ON deaths.date = tdim.date
+	INNER JOIN stg."CovidVaccinations" vacc
+		ON vacc.iso_code = deaths.iso_code
+		AND vacc.date = deaths.date
+	) AS death_agg;
+
+ALTER TABLE dw.cases_fact
+ADD CONSTRAINT cases_fact_pk PRIMARY KEY (iso_code, time_id);
+
+ALTER TABLE dw.cases_fact
+ADD CONSTRAINT cases_fact_time_fk FOREIGN KEY (time_id)
+	REFERENCES dw.time_dim (time_id);
+	
+ALTER TABLE dw.cases_fact
+ADD CONSTRAINT cases_fact_geo_fk FOREIGN KEY (iso_code)
+	REFERENCES dw.geography_dim (iso_code);
+
+-- Creating a deaths fact table from stg
+
+DROP TABLE IF EXISTS dw."deaths_fact";
+
+CREATE TABLE dw."deaths_fact" AS
+SELECT
+	iso_code,
+	time_id,
+	population,
+	total_deaths,
+	new_deaths
+FROM (
+	SELECT
+		vacc.iso_code,
+		tdim.time_id,
+		deaths.population,
+		deaths.total_deaths,
+		deaths.new_deaths
+	FROM stg."CovidDeaths" deaths
+	INNER JOIN dw.time_dim tdim
+		ON deaths.date = tdim.date
+	INNER JOIN stg."CovidVaccinations" vacc
+		ON vacc.iso_code = deaths.iso_code
+		AND vacc.date = deaths.date
+	) AS death_agg;
+
+ALTER TABLE dw.deaths_fact
+ADD CONSTRAINT deaths_fact_pk PRIMARY KEY (iso_code, time_id);
+
+ALTER TABLE dw.deaths_fact
+ADD CONSTRAINT deaths_fact_time_fk FOREIGN KEY (time_id)
+	REFERENCES dw.time_dim (time_id);
+	
+ALTER TABLE dw.deaths_fact
+ADD CONSTRAINT deaths_fact_geo_fk FOREIGN KEY (iso_code)
+	REFERENCES dw.geography_dim (iso_code);
+
+
+-- Generating views for BI reporting
+-- Views will be used in tableau
+
+-- View for all aggregated vaccination measures
+CREATE OR REPLACE VIEW dw.vaccination_aggregate_view
+AS
+WITH cte_vacc_agg AS (
+	SELECT
+		geo.continent,
+		geo."location",
+		tdim.date,
+		COALESCE(vacc.people_vaccinated, 0) vaccinated_one_dose,
+		COALESCE(vacc.people_fully_vaccinated, 0) vaccinated_two_dose,
+		COALESCE(vacc.people_vaccinated, 0) + COALESCE(vacc.people_fully_vaccinated, 0) total_vaccinated,
+		COALESCE(vacc.new_vaccinations, 0) new_vaccinations,
+		d_fact.population population,
+		LAG(COALESCE(vacc.people_vaccinated, 0) + COALESCE(vacc.people_fully_vaccinated, 0), 1) 
+			OVER (PARTITION BY geo."location" ORDER BY tdim.date) prev_total_vaccinated
+	FROM dw.vaccination_fact vacc
+		INNER JOIN dw.geography_dim geo 
+			ON geo.iso_code = vacc.iso_code
+			AND geo.continent IS NOT NULL	--	REMOVES PRE-AGGREGATED MEASURES COMING FROM THE FACT (iso_code = 'OWIN_%')
+		INNER JOIN dw.time_dim tdim ON tdim.time_id = vacc.time_id
+		INNER JOIN (SELECT DISTINCT iso_code, time_id, population FROM dw.deaths_fact) d_fact
+			ON d_fact.iso_code = vacc.iso_code
+				AND d_fact.time_id = vacc.time_id
+)
+SELECT
+	continent,
+	"location",
+	date,
+	population,
+	vaccinated_one_dose,
+	vaccinated_two_dose,
+	total_vaccinated,
+	GREATEST(total_vaccinated - prev_total_vaccinated, new_vaccinations) new_vaccinated, -- NEW VACCINATION FROM SOURCE IS NOT RELIABLE. CALCULATING IT FOR BETTER ACCURACY
+	(vaccinated_one_dose / population) * 100 vaccinated_one_dose_pct,
+	(vaccinated_two_dose / population) * 100 vaccinated_two_dose_pct,
+	(total_vaccinated / population) * 100 total_vaccinated_pct
+FROM
+	cte_vacc_agg;
+
+
+-- View for rolling 1 week vaccinations by geography
+CREATE OR REPLACE VIEW dw.rolling_weekly_vaccinations_view
+AS
+WITH max_collected_date AS (
+		SELECT MAX(time_dim.date) max_date
+		FROM dw.vaccination_fact vacc
+			INNER JOIN dw.time_dim 
+				ON time_dim.time_id = vacc.time_id
+)
+SELECT 
+	geo.continent,
+	geo."location",
+	time_dim.date,
+	TO_CHAR(time_dim.date, 'DY') week_day,
+	COALESCE(vacc.people_vaccinated, 0) vaccinated_one_dose,
+	COALESCE(vacc.people_fully_vaccinated, 0) vaccinated_two_dose,
+	COALESCE(vacc.people_vaccinated, 0) + COALESCE(vacc.people_fully_vaccinated, 0) total_vaccinated
+FROM dw.vaccination_fact vacc
+	INNER JOIN dw.time_dim ON time_dim.time_id = vacc.time_id
+	INNER JOIN dw.geography_dim geo
+		ON geo.iso_code = vacc.iso_code
+		AND geo.continent IS NOT NULL
+WHERE
+	time_dim.date > (
+		SELECT max_date - 7 FROM max_collected_date
+	)
+ORDER BY geo."location", time_dim.date;
+
+
+-- View for cases+vaccination comparison
+
+CREATE OR REPLACE VIEW dw.trend_cases_vaccination_view
+AS
+WITH tot_vacc AS (
+	SELECT
+		time_id,
+		iso_code,
+		COALESCE(people_vaccinated, 0) + COALESCE(people_fully_vaccinated, 0) total_vaccinated
+	FROM dw.vaccination_fact
+)
+SELECT
+	geo.continent,
+	geo."location",
+	tdim.date,
+	COALESCE(cases.total_cases, 0) total_cases,
+	tot_vacc.total_vaccinated
+FROM tot_vacc
+	INNER JOIN dw.cases_fact cases
+		ON tot_vacc.iso_code = cases.iso_code
+		AND tot_vacc.time_id = cases.time_id
+	INNER JOIN dw.geography_dim geo
+		ON geo.iso_code = cases.iso_code
+		AND geo.continent IS NOT NULL
+	INNER JOIN dw.time_dim tdim
+		ON tdim.time_id = cases.time_id
+ORDER BY geo."location", tdim.date;
+
+
+-- View for deaths+cases comparison
+
+CREATE OR REPLACE VIEW dw.trend_cases_deaths_view
+AS
+SELECT
+	geo.continent,
+	geo."location",
+	tdim.date,
+	COALESCE(cases.total_cases, 0) total_cases,
+	COALESCE(deaths.total_deaths, 0) total_deaths
+FROM dw.cases_fact cases
+	INNER JOIN dw.time_dim tdim
+		ON tdim.time_id = cases.time_id
+	INNER JOIN dw.geography_dim geo
+		ON geo.iso_code = cases.iso_code
+		AND geo.continent IS NOT NULL
+	INNER JOIN dw.deaths_fact deaths
+		ON cases.iso_code = deaths.iso_code
+		AND cases.time_id = deaths.time_id
+ORDER BY geo."location", tdim.date;
+
