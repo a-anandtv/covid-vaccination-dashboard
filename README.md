@@ -1,7 +1,12 @@
 # Covid Vaccination Dashboard
+An analytic dashboard for the world covid vaccination data collected from the ourworldindata.com database. The data is then hosted in a postgreSQL database and used in Tableau to design the dashboard. 
 
 ### Dashboard design
 The design for the dashboard was influenced by the impfdashboard.de design.
+
+<p align="center">
+  <img src="https://github.com/a-anandtv/covid-vaccination-dashboard/blob/main/resources/vaccination_progress.png" >
+</p>
 
 #### Concepts used in the dashboard:
 * Aggregate Measures
